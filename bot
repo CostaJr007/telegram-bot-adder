@@ -1,0 +1,169 @@
+# -*- coding: utf-8 -*-
+from telethon import TelegramClient, functions
+from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, UsernameNotOccupiedError, PeerIdInvalidError, \
+    UserChannelsTooMuchError, PasswordHashInvalidError
+import asyncio
+import re
+import json
+import time
+from datetime import datetime, timedelta, UTC
+import os
+
+# --- CONFIGURAÇÃO ---
+api_id = 27622230
+api_hash = 'a4c314e948b68f72a1579298a1f1856d'
+phone = '+5581998731368'
+group_username = 'OrochiiFX'
+
+# --- ARQUIVOS DE ESTADO ---
+users_file = 'users.txt'
+added_users_file = 'added_users.json'
+daily_stats_file = 'daily_stats.json'
+
+# --- LIMITES DE SEGURANÇA ---
+daily_limit = 45
+# Intervalo LONGO para depois de um SUCESSO
+add_interval_success = 1800  # 30 minutos
+# MELHORIA: Intervalo CURTO para depois de um ERRO
+add_interval_error = 45  # 45 segundos (pode ajustar entre 30 e 90)
+
+
+# (O resto do código, até a função main, continua igual)
+def load_or_create_json(filename, default):
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return default
+    else:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(default, f, indent=4)
+        return default
+
+
+def save_json(filename, data):
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4)
+
+
+def get_next_user(users, added_users):
+    for user_info in users:
+        if str(user_info['id']) not in added_users:
+            return user_info
+    return None
+
+
+def is_new_day(last_date):
+    today = datetime.now(UTC).date()
+    last_date_obj = datetime.strptime(last_date, '%Y-%m-%d').date()
+    return today > last_date_obj
+
+
+async def main():
+    try:
+        with open(users_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f"Erro: O arquivo '{users_file}' não foi encontrado.")
+        return
+    users = []
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        match = re.search(r'@?(\w+)\s+\[(\d+)\]$', line) or re.search(r'\[(\d+)\]$', line)
+        if match:
+            user_id = int(match.groups()[-1])
+            username = match.groups()[0] if len(match.groups()) > 1 else f"ID_{user_id}"
+            users.append({'id': user_id, 'username': username})
+    if not users:
+        print("Nenhum usuário válido encontrado no arquivo 'users.txt'.")
+        return
+    async with TelegramClient('session_name', api_id, api_hash) as client:
+        if not await client.is_user_authorized():
+            try:
+                await client.sign_in(phone, code=input('Digite o código de verificação: '),
+                                     password=input('Digite sua senha de nuvem (se tiver): '))
+            except PasswordHashInvalidError:
+                print("ERRO: Senha incorreta.")
+                return
+            except Exception as e:
+                print(f"Ocorreu um erro durante o login: {e}")
+                return
+        added_users = load_or_create_json(added_users_file, {})
+        daily_stats = load_or_create_json(daily_stats_file, {'count': 0, 'last_date': (
+                    datetime.now(UTC) - timedelta(days=1)).strftime('%Y-%m-%d')})
+        if is_new_day(daily_stats['last_date']):
+            print("✨ Novo dia! Resetando a contagem diária.")
+            daily_stats['count'] = 0
+            daily_stats['last_date'] = datetime.now(UTC).strftime('%Y-%m-%d')
+            save_json(daily_stats_file, daily_stats)
+        try:
+            group = await client.get_entity(group_username)
+        except Exception as e:
+            print(f"❌ Erro fatal ao acessar o grupo '{group_username}': {e}")
+            return
+        print(f"🚀 Script iniciado. Tentando adicionar membros ao grupo '{getattr(group, 'title', group_username)}'.")
+        print(
+            f"📊 Limite diário: {daily_limit} | Intervalo sucesso: {add_interval_success / 60} min | Intervalo erro: {add_interval_error} seg.")
+        while True:
+            user_to_add = get_next_user(users, added_users)
+            if user_to_add is None:
+                print("🏁 Todos os usuários da lista já foram processados.")
+                break
+
+            user_id = user_to_add['id']
+            username = user_to_add['username']
+            if daily_stats['count'] >= daily_limit:
+                next_reset = (datetime.now(UTC) + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                wait_time = (next_reset - datetime.now(UTC)).total_seconds()
+                if wait_time > 0:
+                    print(f"✋ Limite diário atingido. Aguardando {wait_time / 3600:.1f} horas.")
+                    await asyncio.sleep(wait_time)
+                daily_stats['count'] = 0
+                daily_stats['last_date'] = datetime.now(UTC).strftime('%Y-%m-%d')
+                save_json(daily_stats_file, daily_stats)
+                continue
+
+            # # # # # # # # # # # # # # # # # # # # # # # # #
+            # LÓGICA DO TEMPO DE ESPERA INTELIGENTE
+            # # # # # # # # # # # # # # # # # # # # # # # # #
+            sleep_time = add_interval_error  # Padrão é o tempo de espera CURTO
+            try:
+                print(f"👉 Tentando adicionar usuário: {username} (ID: {user_id})")
+                user_entity = await client.get_entity(user_id)
+                await client(functions.channels.InviteToChannelRequest(channel=group, users=[user_entity]))
+
+                added_users[str(user_id)] = 'added_successfully'
+                daily_stats['count'] += 1
+                save_json(added_users_file, added_users)
+                save_json(daily_stats_file, daily_stats)
+                print(f"✅ SUCESSO! Adicionado {username}. Total do dia: {daily_stats['count']}/{daily_limit}")
+
+                sleep_time = add_interval_success  # Se deu SUCESSO, muda para o tempo de espera LONGO
+
+            except UserPrivacyRestrictedError:
+                print(f"🔒 PRIVACIDADE: {username} não permite ser adicionado. Pulando.")
+                added_users[str(user_id)] = 'skipped_privacy'
+            except UserChannelsTooMuchError:
+                print(f"📦 LOTADO: {username} já está no máximo de grupos. Pulando.")
+                added_users[str(user_id)] = 'skipped_too_many_channels'
+            except (UsernameNotOccupiedError, PeerIdInvalidError):
+                print(f"❓ INEXISTENTE: {username} (ID: {user_id}) não foi encontrado. Pulando.")
+                added_users[str(user_id)] = 'skipped_invalid'
+            except FloodWaitError as e:
+                print(f"⏳ FLOOD WAIT: O Telegram pediu para aguardar {e.seconds} segundos. Pausando...")
+                sleep_time = e.seconds  # Obedece o tempo pedido pelo Telegram
+                continue
+            except Exception as e:
+                print(f"❌ ERRO INESPERADO ao adicionar {username}: {e}. Pulando.")
+                added_users[str(user_id)] = f'skipped_error: {e}'
+
+            save_json(added_users_file, added_users)
+
+            print(f"⏰ Aguardando {sleep_time} segundos para a próxima tentativa.")
+            await asyncio.sleep(sleep_time)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
